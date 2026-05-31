@@ -1,0 +1,328 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: AussieEcoLens - Multi-Cloud Wildlife Observation Platform (Academy)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, prod]
+  GCPInferUrl:
+    Type: String
+    Default: https://placeholder-infer-url.a.run.app
+  GCPInternalSecret:
+    Type: String
+    Default: aussie-ecolens-secret-2026
+    NoEcho: true
+  LambdaDeployBucket:
+    Type: String
+    Default: aussie-ecolens-deploy-g62
+
+Resources:
+
+  # --- S3 Bucket ---
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub aussie-ecolens-g62-${Environment}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [GET, PUT, POST]
+            AllowedOrigins: ["*"]
+            MaxAge: 3600
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+
+  # --- DynamoDB: Files ---
+  FilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub AussieEcoLens-Files-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: fileId
+          AttributeType: S
+        - AttributeName: ownerSub
+          AttributeType: S
+        - AttributeName: checksumSha256
+          AttributeType: S
+        - AttributeName: fileUrl
+          AttributeType: S
+        - AttributeName: thumbnailUrl
+          AttributeType: S
+      KeySchema:
+        - AttributeName: fileId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ownerSub-checksum-index
+          KeySchema:
+            - AttributeName: ownerSub
+              KeyType: HASH
+            - AttributeName: checksumSha256
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: fileUrl-index
+          KeySchema:
+            - AttributeName: fileUrl
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: thumbnailUrl-index
+          KeySchema:
+            - AttributeName: thumbnailUrl
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ownerSub-index
+          KeySchema:
+            - AttributeName: ownerSub
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # --- DynamoDB: MediaTags ---
+  MediaTagsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub AussieEcoLens-MediaTags-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tagName
+          AttributeType: S
+        - AttributeName: fileId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tagName
+          KeyType: HASH
+        - AttributeName: fileId
+          KeyType: RANGE
+
+  # --- DynamoDB: TagSubscriptions ---
+  TagSubscriptionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub AussieEcoLens-TagSubscriptions-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: subscriptionId
+          AttributeType: S
+        - AttributeName: ownerSub
+          AttributeType: S
+        - AttributeName: tagName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: subscriptionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ownerSub-index
+          KeySchema:
+            - AttributeName: ownerSub
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: tagName-index
+          KeySchema:
+            - AttributeName: tagName
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # --- SNS Topic ---
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub AussieEcoLens-Notifications-${Environment}
+
+  # --- Cognito ---
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub AussieEcoLens-Users-${Environment}
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+        - Name: given_name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: family_name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub AussieEcoLens-Client-${Environment}
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # --- API Gateway ---
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub AussieEcoLens-API-${Environment}
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  ApiGatewayAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      RestApiId: !Ref ApiGateway
+      Type: COGNITO_USER_POOLS
+      ProviderARNs:
+        - !GetAtt CognitoUserPool.Arn
+      IdentitySource: method.request.header.Authorization
+
+  ApiGatewayProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "{proxy+}"
+
+  ApiGatewayProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiGatewayProxyResource
+      HttpMethod: ANY
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations
+
+  ApiGatewayProxyOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiGatewayProxyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  # --- Lambda: API Handler ---
+  ApiLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub AussieEcoLens-API-${Environment}
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::477216322118:role/LabRole
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref MediaBucket
+          FILES_TABLE: !Ref FilesTable
+          MEDIA_TAGS_TABLE: !Ref MediaTagsTable
+          TAG_SUBS_TABLE: !Ref TagSubscriptionsTable
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          GCP_INFER_URL: !Ref GCPInferUrl
+          GCP_INTERNAL_SECRET: !Ref GCPInternalSecret
+      Code:
+        S3Bucket: !Ref LambdaDeployBucket
+        S3Key: lambdas/api_handler.zip
+
+  # --- Lambda: Process Handler ---
+  ProcessLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub AussieEcoLens-Process-${Environment}
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::477216322118:role/LabRole
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref MediaBucket
+          FILES_TABLE: !Ref FilesTable
+          MEDIA_TAGS_TABLE: !Ref MediaTagsTable
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          GCP_INFER_URL: !Ref GCPInferUrl
+          GCP_INTERNAL_SECRET: !Ref GCPInternalSecret
+      Code:
+        S3Bucket: !Ref LambdaDeployBucket
+        S3Key: lambdas/process_handler.zip
+
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiLambda
+      Principal: apigateway.amazonaws.com
+
+  ProcessLambdaS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessLambda
+      Principal: s3.amazonaws.com
+
+  # --- API Gateway Deployment ---
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayProxyMethod
+      - ApiGatewayProxyOptions
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiGatewayDeployment
+      StageName: !Ref Environment
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+  CognitoUserPoolId:
+    Value: !Ref CognitoUserPool
+  CognitoUserPoolClientId:
+    Value: !Ref CognitoUserPoolClient
+  CognitoJwksUrl:
+    Value: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}/.well-known/jwks.json
+  MediaBucketName:
+    Value: !Ref MediaBucket
+  ProcessLambdaArn:
+    Value: !GetAtt ProcessLambda.Arn
+  S3WebsiteUrl:
+    Value: !Sub http://${MediaBucket}.s3-website-${AWS::Region}.amazonaws.com

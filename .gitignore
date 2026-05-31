@@ -17,3 +17,4 @@ Thumbs.db
 test-images/
 *.ipynb_checkpoints/
 fit-5225-a2-*.json
+*.tsbuildinfo
